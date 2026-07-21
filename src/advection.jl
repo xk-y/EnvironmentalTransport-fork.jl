@@ -194,13 +194,16 @@ mutable struct AdvectionOperator <: EarthSciMLBase.Operator
 end
 
 function obs_function(mtk_sys, coord_args, v, T)
-    obs_f = EarthSciMLBase.build_coord_observed_function(
-        mtk_sys, coord_args, [v];
+    # Scalar form: the vector form's out-of-place call `(u, p, t, c1, c2, c3)`
+    # heap-allocates a fresh length-1 array on EVERY read, and this reader runs
+    # per species per grid cell per stage in the advection kernel.
+    obs_f = EarthSciMLBase.build_coord_observed_scalar_function(
+        mtk_sys, coord_args, v;
         eval_module = @__MODULE__
     )
     obscache = zeros(T, length(unknowns(mtk_sys))) # Not used for anything (hopefully).
     function data_f(p, t, x1, x2, x3)
-        return only(obs_f(obscache, p, t, x1, x2, x3))
+        return obs_f(obscache, p, t, x1, x2, x3)
     end
     return data_f
 end
