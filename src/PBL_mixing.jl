@@ -166,12 +166,14 @@ end
 Create an observed function for extracting data from the ModelingToolkit system.
 """
 function pbl_obs_function(mtk_sys, coord_args, v, T)
-    obs_f = EarthSciMLBase.build_coord_observed_function(
-        mtk_sys, coord_args, [v];
+    # Scalar form: the vector form's out-of-place call heap-allocates a fresh
+    # length-1 array on every read (see obs_function in advection.jl).
+    obs_f = EarthSciMLBase.build_coord_observed_scalar_function(
+        mtk_sys, coord_args, v;
         eval_module = @__MODULE__
     )
     obscache = zeros(T, length(unknowns(mtk_sys)))
-    return (p, t, x1, x2, x3) -> only(obs_f(obscache, p, t, x1, x2, x3))
+    return (p, t, x1, x2, x3) -> obs_f(obscache, p, t, x1, x2, x3)
 end
 
 """
