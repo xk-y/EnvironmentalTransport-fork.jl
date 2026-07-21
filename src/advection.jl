@@ -63,19 +63,38 @@ function advection_op(
     sz = size(u_prototype)
     v_fs = tuple(v_fs...)
     Δ_fs = tuple(Δ_fs...)
-    II = CartesianIndices(u_prototype)
-    adv_kernel = advection_kernel_4d_builder(stencil, v_fs, Δ_fs)
+    # The velocity and grid-spacing accessors depend only on the spatial index
+    # and time, not on the species, so iterate over space in the outer
+    # (parallelized) loop and reuse each cell's values across all species
+    # instead of re-evaluating them per (species, cell) pair.
+    IIspace = CartesianIndices((sz[2], sz[3], sz[4]))
+    nspec = sz[1]
     function advection(u, p, t) # Out-of-place
         u = bc_type(reshape(u, sz...))
-        kernelII(II) = adv_kernel(u, II, Δt, t, p)
-        du = EarthSciMLBase.map_closure_to_range(kernelII, II, alg)
-        return reshape(du, :)
+        function kernelII(IIs)
+            i, j, k = Tuple(IIs)
+            vs = get_vs(v_fs, i, j, k, p, t)
+            Δs = get_Δs(Δ_fs, i, j, k, p, t)
+            [advection_kernel_4d(u, stencil, vs, Δs, Δt, CartesianIndex(s, i, j, k), p)
+             for s in 1:nspec]
+        end
+        du = EarthSciMLBase.map_closure_to_range(kernelII, IIspace, alg)
+        return reshape(stack(du), :)
     end
     function advection(du, u, p, t) # In-place
         u = bc_type(reshape(u, sz...))
         du = reshape(du, sz...)
-        kernelII(II) = du[II] = adv_kernel(u, II, Δt, t, p)
-        EarthSciMLBase.map_closure_to_range(kernelII, II, alg)
+        function kernelII(IIs)
+            i, j, k = Tuple(IIs)
+            vs = get_vs(v_fs, i, j, k, p, t)
+            Δs = get_Δs(Δ_fs, i, j, k, p, t)
+            for s in 1:nspec
+                du[s, i, j, k] = advection_kernel_4d(
+                    u, stencil, vs, Δs, Δt, CartesianIndex(s, i, j, k), p)
+            end
+            nothing
+        end
+        EarthSciMLBase.map_closure_to_range(kernelII, IIspace, alg)
         return nothing
     end
     return advection
