@@ -8,13 +8,12 @@
     using OrdinaryDiffEq: ODEProblem, solve
 
     # A single column (1 species, 1×1×nz cells) on a pressure-like (negative-Δ)
-    # vertical coordinate with no horizontal wind. The vertical face velocity is
-    # `w(k)` at the bottom face of level k, zero at the ground and growing with
-    # height; positive `w` on a pressure coordinate is subsidence, i.e. inflow from
-    # the top boundary. `wmax` sets the peak vertical Courant number.
-    function column_setup(nz, wmax; Δz = -100.0)
-        w(k) = wmax * (k - 1) / nz
-        v_fs = ((i, j, k, p, t) -> 0.0, (i, j, k, p, t) -> 0.0, (i, j, k, p, t) -> w(k))
+    # vertical coordinate with no horizontal wind and a uniform (divergence-free)
+    # vertical face velocity `w`. Positive `w` on a pressure coordinate is
+    # subsidence, i.e. inflow from the top boundary. The vertical Courant number
+    # is `w·Δt/|Δz|` in every cell.
+    function column_setup(w; Δz = -100.0)
+        v_fs = ((i, j, k, p, t) -> 0.0, (i, j, k, p, t) -> 0.0, (i, j, k, p, t) -> w)
         Δ_fs = ((i, j, k, p, t) -> 1.0, (i, j, k, p, t) -> 1.0, (i, j, k, p, t) -> Δz)
         return v_fs, Δ_fs
     end
@@ -46,6 +45,8 @@ end
     nz = 8
     lpad, rpad = EnvironmentalTransport.stencil_size(upwind1_stencil)
     Δt = 300.0
+    # height-varying face velocities: the sub-cycling must reproduce n explicit
+    # sub-steps of the stencil exactly, whatever the wind profile
     vzs = [(3.0 * (k - 1) / nz, 3.0 * k / nz) for k in 1:nz]
     Δzs = fill(-100.0, nz)
     ϕ0 = [10.0, 10, 10, 50, 50, 50, 10, 10]
@@ -69,15 +70,21 @@ end
     end
     @test colp ≈ reference
     @test !(colp ≈ vcat(fill(ϕ0[1], lpad), ϕ0, fill(ϕ0[end], rpad)))   # something moved
-    # monotone: no new extrema
-    @test minimum(colp) >= minimum(ϕ0) - 1e-12
-    @test maximum(colp) <= maximum(ϕ0) + 1e-12
+
+    # with a uniform wind (no divergence) the sub-cycled column is monotone
+    vzs_u = fill((3.0, 3.0), nz)
+    n_u = vertical_subcycles([inflow_courant(vzs_u[k], Δzs[k], Δt) for k in 1:nz], 100)
+    @test n_u == 9
+    colu = vcat(fill(ϕ0[1], lpad), copy(ϕ0), fill(ϕ0[end], rpad))
+    subcycle_column!(colu, zeros(nz), upwind1_stencil, vzs_u, Δzs, Δt, n_u, nz, lpad, rpad, nothing)
+    @test minimum(colu) >= minimum(ϕ0) - 1e-12
+    @test maximum(colu) <= maximum(ϕ0) + 1e-12
 end
 
 @testitem "advection op: unchanged when the vertical Courant number is at most one" setup = [SubcycleSetup] begin
     nz = 12
     Δt = 300.0
-    v_fs, Δ_fs = column_setup(nz, 0.3)             # peak Courant 0.3·(11/12)·300/100 = 0.83 < 1
+    v_fs, Δ_fs = column_setup(0.3)                 # Courant 0.3·300/100 = 0.9 < 1
     c = zeros(1, 1, 1, nz)
     c[1, 1, 1, :] .= [5.0, 5, 5, 20, 40, 20, 5, 5, 5, 30, 30, 5]
     op_dt = advection_op(c, upwind1_stencil, v_fs, Δ_fs, Δt, ZeroGradBC(), MapBroadcast())
@@ -90,9 +97,7 @@ end
     @test d3 == d1                                   # in-place == out-of-place
     # the plain tendency equals the sum of the per-direction stencils (x, y are zero)
     cc = ZeroGradBC()(c)
-    manual = [upwind1_stencil(cc[1, 1, 1, (k - 1):(k + 1)],
-                  (v_fs[3](1, 1, k, nothing, 0.0), v_fs[3](1, 1, k + 1, nothing, 0.0)),
-                  Δt, -100.0) for k in 1:nz]
+    manual = [upwind1_stencil(cc[1, 1, 1, (k - 1):(k + 1)], (0.3, 0.3), Δt, -100.0) for k in 1:nz]
     @test d1 ≈ manual
     @test any(!iszero, d1)
 end
@@ -100,8 +105,7 @@ end
 @testitem "advection op: sub-cycling keeps a column monotone at Courant > 1" setup = [SubcycleSetup] begin
     nz = 12
     Δt = 300.0
-    wmax = 0.8                        # peak Courant 0.8·(11/12)·300/100 = 2.2 → 3 sub-steps
-    v_fs, Δ_fs = column_setup(nz, wmax)
+    v_fs, Δ_fs = column_setup(0.75)                # Courant 0.75·300/100 = 2.25 → 3 sub-steps
     c = zeros(1, 1, 1, nz)
     c[1, 1, 1, :] .= [5.0, 5, 5, 20, 40, 20, 5, 5, 5, 30, 30, 5]
     bc = ConstantBC(50.0)             # air subsiding in from the top carries 50
@@ -145,21 +149,20 @@ end
 end
 
 @testitem "advection op: sub-cycling with horizontal wind and species boundary values" setup = [SubcycleSetup] begin
-    # 2 species, 4×3×6 cells; strong subsidence (Courant up to 2.7) plus a gentle
-    # horizontal wind (Courant 0.2 each), species-specific constant boundary values.
-    # The update must remain a convex combination of old values and boundary
-    # values for every cell.
+    # 2 species, 4×3×6 cells; uniform strong subsidence (Courant 2.25) plus a
+    # gentle uniform horizontal wind (Courant 0.2 each), species-specific constant
+    # boundary values. The update must remain a convex combination of old values
+    # and boundary values for every cell.
     nspec, nx, ny, nz = 2, 4, 3, 6
     Δt = 300.0
-    v_fs = ((i, j, k, p, t) -> 2.0, (i, j, k, p, t) -> -2.0, (i, j, k, p, t) -> 0.15 * (k - 1))
+    v_fs = ((i, j, k, p, t) -> 2.0, (i, j, k, p, t) -> -2.0, (i, j, k, p, t) -> 0.75)
     Δ_fs = ((i, j, k, p, t) -> 3000.0, (i, j, k, p, t) -> 3000.0, (i, j, k, p, t) -> -100.0)
     c = rand(nspec, nx, ny, nz) .* 10
     c[2, :, :, :] .+= 100
     bcvals = (3.0, 200.0)
     bc = SpeciesConstantBC(Dict(1 => bcvals[1], 2 => bcvals[2]), 0.0)
     op = advection_op(c, upwind1_stencil, v_fs, Δ_fs, Δt, bc, MapBroadcast())
-    @test inflow_courant((v_fs[3](1, 1, nz, nothing, 0.0), v_fs[3](1, 1, nz + 1, nothing, 0.0)),
-        -100.0, Δt) > 2
+    @test inflow_courant((0.75, 0.75), -100.0, Δt) > 2
     unew = reshape(c[:] .+ Δt .* op(c[:], NullParameters(), 0.0), size(c))
     for s in 1:nspec
         lo = min(minimum(c[s, :, :, :]), bcvals[s])
@@ -167,6 +170,11 @@ end
         @test minimum(unew[s, :, :, :]) >= lo - 1e-9
         @test maximum(unew[s, :, :, :]) <= hi + 1e-9
     end
+    # the plain tendency at this Courant number does NOT respect the bounds
+    op_nan = advection_op(c, upwind1_stencil, v_fs, Δ_fs, NaN, bc, MapBroadcast())
+    uplain = reshape(c[:] .+ Δt .* op_nan(c[:], NullParameters(), 0.0), size(c))
+    @test any(s -> minimum(uplain[s, :, :, :]) < min(minimum(c[s, :, :, :]), bcvals[s]) - 1e-9 ||
+                   maximum(uplain[s, :, :, :]) > max(maximum(c[s, :, :, :]), bcvals[s]) + 1e-9, 1:nspec)
     # in-place path gives the same answer
     d = zeros(length(c))
     op(d, c[:], NullParameters(), 0.0)
