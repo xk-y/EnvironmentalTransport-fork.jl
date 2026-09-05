@@ -186,6 +186,11 @@ advective form `−u·∂ϕ/∂x`, which leaves a uniform mixing ratio EXACTLY u
 field; the fully correct fix is mass-coupled flux form (advect ϕ·Δp/g with a vertical
 mass flux re-diagnosed from horizontal-flux continuity, as GEOS-Chem/TPCORE does).
 See maintain/PR_DRAFTS/EnvironmentalTransport-31-advection-mass-consistency.md.
+
+Stability: as an explicit scheme this stencil is monotone only for an inflow Courant
+number `|U|·Δt/Δz ≤ 1` (see `inflow_courant`). The stencil itself does not enforce
+this; `advection_op` keeps the vertical direction within that limit by sub-cycling
+the column wherever the vertical Courant number exceeds one.
 """
 function upwind1_stencil(ϕ, U, Δt, Δz; p = nothing)
     sz = sign(Δz) # Handle negative grid spacing
